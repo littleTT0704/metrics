@@ -42,33 +42,22 @@ export default async function({login, data, rest, imports, q, account}, {enabled
     console.debug(`metrics/compute/${login}/plugins > habits > filtered out ${commits.length} push events over last ${days} days`)
     habits.commits.fetched = commits.length
 
-    //Resolve commits for each push event
-    //GitHub's events API no longer embeds `payload.commits`, so commit shas are resolved from
-    //each push range (before...head) through the compare endpoint (falling back to the legacy
-    //embedded commits when still present). Each commit is then matched against authoring identities.
-    console.debug(`metrics/compute/${login}/plugins > habits > resolving commits`)
-    const resolved = [
-      ...await Promise.allSettled(
-        commits.map(async ({repo: {name}, payload}) => {
-          const [owner, repo] = name.split("/")
-          let list = payload.commits
-          if (!Array.isArray(list) || (!list.length)) {
-            const {data: compared} = await rest.repos.compareCommitsWithBasehead({owner, repo, basehead: `${payload.before}...${payload.head}`})
-            list = (compared.commits ?? []).map(({sha, author, commit}) => ({sha, author: {login: author?.login, name: commit?.author?.name, email: commit?.author?.email}}))
-          }
-          return list.map(commit => ({owner, repo, commit}))
-        }),
-      ),
-    ]
-      .filter(({status}) => status === "fulfilled")
-      .flatMap(({value}) => value)
-      .filter(({commit: {author}}) => data.shared["commits.authoring"].filter(authoring => author?.login?.toLocaleLowerCase().includes(authoring) || author?.email?.toLocaleLowerCase().includes(authoring) || author?.name?.toLocaleLowerCase().includes(authoring)).length)
-
     //Retrieve edited files and filter edited lines (those starting with +/-) from patches
+    //GitHub's events API no longer embeds `payload.commits`, so the edited files are retrieved from
+    //the aggregated diff of each push range (before...head) through the compare endpoint. This uses a
+    //single request per push event (rather than one per commit), which keeps the API footprint small
+    //and avoids tripping secondary rate limits that would starve other plugins (e.g. languages, followup).
+    //The events are already restricted to pushes performed by the user, so the diff reflects their work.
     console.debug(`metrics/compute/${login}/plugins > habits > loading patches`)
     const patches = [
       ...await Promise.allSettled(
-        resolved.map(async ({owner, repo, commit: {sha}}) => (await rest.repos.getCommit({owner, repo, ref: sha})).data.files),
+        commits.map(async ({repo: {name}, payload}) => {
+          if (Array.isArray(payload.commits) && (payload.commits.length))
+            return (await Promise.allSettled(payload.commits.map(async commit => (await rest.request(commit.url)).data.files))).filter(({status}) => status === "fulfilled").flatMap(({value}) => value ?? [])
+          const [owner, repo] = name.split("/")
+          const {data: compared} = await rest.repos.compareCommitsWithBasehead({owner, repo, basehead: `${payload.before}...${payload.head}`})
+          return compared.files ?? []
+        }),
       ),
     ]
       .filter(({status}) => status === "fulfilled")
