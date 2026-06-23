@@ -42,19 +42,38 @@ export default async function({login, data, rest, imports, q, account}, {enabled
     console.debug(`metrics/compute/${login}/plugins > habits > filtered out ${commits.length} push events over last ${days} days`)
     habits.commits.fetched = commits.length
 
+    //Resolve commits for each push event
+    //GitHub's events API no longer embeds `payload.commits`, so commit shas are resolved from
+    //each push range (before...head) through the compare endpoint (falling back to the legacy
+    //embedded commits when still present). Each commit is then matched against authoring identities.
+    console.debug(`metrics/compute/${login}/plugins > habits > resolving commits`)
+    const resolved = [
+      ...await Promise.allSettled(
+        commits.map(async ({repo: {name}, payload}) => {
+          const [owner, repo] = name.split("/")
+          let list = payload.commits
+          if (!Array.isArray(list) || (!list.length)) {
+            const {data: compared} = await rest.repos.compareCommitsWithBasehead({owner, repo, basehead: `${payload.before}...${payload.head}`})
+            list = (compared.commits ?? []).map(({sha, author, commit}) => ({sha, author: {login: author?.login, name: commit?.author?.name, email: commit?.author?.email}}))
+          }
+          return list.map(commit => ({owner, repo, commit}))
+        }),
+      ),
+    ]
+      .filter(({status}) => status === "fulfilled")
+      .flatMap(({value}) => value)
+      .filter(({commit: {author}}) => data.shared["commits.authoring"].filter(authoring => author?.login?.toLocaleLowerCase().includes(authoring) || author?.email?.toLocaleLowerCase().includes(authoring) || author?.name?.toLocaleLowerCase().includes(authoring)).length)
+
     //Retrieve edited files and filter edited lines (those starting with +/-) from patches
     console.debug(`metrics/compute/${login}/plugins > habits > loading patches`)
     const patches = [
       ...await Promise.allSettled(
-        commits
-          .flatMap(({payload}) => payload.commits ?? [])
-          .filter((commit) => commit && data.shared["commits.authoring"].filter(authoring => commit.author?.login?.toLocaleLowerCase().includes(authoring) || commit.author?.email?.toLocaleLowerCase().includes(authoring) || commit.author?.name?.toLocaleLowerCase().includes(authoring)).length)
-          .map(async commit => (await rest.request(commit)).data.files),
+        resolved.map(async ({owner, repo, commit: {sha}}) => (await rest.repos.getCommit({owner, repo, ref: sha})).data.files),
       ),
     ]
       .filter(({status}) => status === "fulfilled")
       .map(({value}) => value)
-      .flatMap(files => files.map(file => ({name: imports.paths.basename(file.filename), patch: file.patch ?? ""})))
+      .flatMap(files => (files ?? []).map(file => ({name: imports.paths.basename(file.filename), patch: file.patch ?? ""})))
       .map(({name, patch}) => ({name, patch: patch.split("\n").filter(line => /^[+]/.test(line)).map(line => line.substring(1)).join("\n")}))
 
     //Commit day
